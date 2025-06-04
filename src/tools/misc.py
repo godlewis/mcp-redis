@@ -5,21 +5,28 @@ from common.server import mcp
 
 
 @mcp.tool()
-async def delete(key: str) -> str:
-    """Delete a Redis key.
+async def delete(keys: list[str]) -> dict:
+    """
+    批量删除Redis中的一个或多个key。
 
     Args:
-        key (str): The key to delete.
+        keys (list[str]): 要删除的key列表。
 
     Returns:
-        str: Confirmation message or an error message.
+        dict: {"deleted": 删除的key数量, "details": 每个key的删除结果}
     """
     try:
         r = RedisConnectionManager.get_connection()
-        result = r.delete(key)
-        return f"Successfully deleted {key}" if result else f"Key {key} not found"
+        # redis-py 的 delete 支持 *keys 传递多个key
+        deleted_count = r.delete(*keys)
+        # 详细结果：哪些key被删除，哪些没找到
+        details = {}
+        for key in keys:
+            # exists返回0说明没找到，1说明已删除
+            details[key] = not r.exists(key)
+        return {"deleted": deleted_count, "details": details}
     except RedisError as e:
-        return f"Error deleting key {key}: {str(e)}"
+        return {"error": str(e)}
 
 
 @mcp.tool()  
@@ -102,6 +109,10 @@ async def scan(pattern: str = "*", count: int = 10, cursor: int = 0) -> dict:
     """
     使用SCAN命令进行Redis key的模式匹配查询。
 
+    支持单机和集群模式：
+    - 单机模式：原有 scan 逻辑。
+    - 集群模式：遍历所有 master 节点分别 scan 并合并结果。
+
     Args:
         pattern (str): key的匹配模式，默认为"*"
         count (int): 每次扫描返回的最大key数，默认为10
@@ -112,11 +123,33 @@ async def scan(pattern: str = "*", count: int = 10, cursor: int = 0) -> dict:
     """
     try:
         r = RedisConnectionManager.get_connection()
-        next_cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
-        return {
-            "keys": keys,
-            "next_cursor": next_cursor,
-            "finished": next_cursor == 0
-        }
+        # 判断是否为集群模式
+        if hasattr(r, "get_nodes") and hasattr(r, "get_redis_connection"):
+            # RedisCluster 实例
+            all_keys = set()
+            for node in r.get_nodes():
+                # 只遍历主节点（server_type=="primary" 或 "master"，兼容不同redis-py版本）
+                if getattr(node, "server_type", None) in ("primary", "master"):
+                    node_conn = getattr(node, "redis_connection", None)
+                    if node_conn is not None:
+                        node_cursor = 0
+                        while True:
+                            node_cursor, keys = node_conn.scan(cursor=node_cursor, match=pattern, count=count)
+                            all_keys.update(keys)
+                            if node_cursor == 0:
+                                break
+            return {
+                "keys": list(all_keys),
+                "next_cursor": 0,
+                "finished": True
+            }
+        else:
+            # 单机模式
+            next_cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
+            return {
+                "keys": keys,
+                "next_cursor": next_cursor,
+                "finished": next_cursor == 0
+            }
     except RedisError as e:
         return {"error": str(e)}
